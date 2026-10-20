@@ -1,0 +1,47 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Environment
+Isolated dev environment. If tools are missing, talk to the human. `sudo` works without a password.
+Permanent changes (Dockerfile, user config) need the human's OK.
+This jail will be respun up periodically; everything not in the projects directory is temporary and will be lost.
+
+## Commands
+Go 1.27 in `/usr/local/go`. Env sets `GOPATH=~/go`, which Go rejects (literal `~`); prefix commands with `GOPATH=$HOME/go`.
+- Build/run: `go build -o apt-cachealot ./cmd/apt-cachealot && ./apt-cachealot -dir ./cache -listen :3142`
+- Docker: `docker build -t apt-cachealot .` (multi-stage, static binary on `gcr.io/distroless/static-debian13:nonroot`, uid 65532, no shell, `-healthcheck` flag backs `HEALTHCHECK`). There is no docker in the dev jail; CI builds and smoke-tests the image. `Dockerfile.az` is the dev jail image, unrelated.
+- CI (`.github/workflows/ci.yml`): gofmt, `go mod tidy` clean, vet, `go test -race`, static build; second job builds the Docker image and smoke-tests it (`scripts/smoke.sh`: miss, hit, proxy mode, stats) in two setups: default user with anonymous volume, and bind mount as host uid like `docker-compose.yml`; it also checks clean exit on SIGTERM and that `state.json` was saved. `scripts/smoke.sh <cache-url> <upstream host:port>` also runs against a local binary. Keep these passing locally before pushing. The Docker job is the first real build of the Dockerfile.
+- Test: `go test -race ./...`; single: `go test -run TestMissThenHit ./internal/proxy`
+- Benchmark direct vs cold vs warm: `./scripts/bench.sh deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.xz ./cache`
+
+## License
+GPL-3.0-or-later (`LICENSE` is the Debian copy of the GPL-3 text). New `.go` and `.sh` files start with `SPDX-License-Identifier: GPL-3.0-or-later` (Go: then a blank line, so it does not become part of a package doc comment). New dependencies need a compatible license and an entry in `THIRD_PARTY_LICENSES`.
+
+## Architecture (all planned phases done)
+- Layout: `cmd/apt-cachealot` (flags, `-max-size` parsing, graceful shutdown, `-healthcheck`); `internal/proxy` (everything HTTP and storage); `internal/lru` (size limit, eviction, persisted last-use times); `internal/pkgindex` (Packages parsing, URL to sha256 map); `scripts/bench.sh`; `docs/idea.md` (original design notes). Module path `github.com/heilig/apt-cachealot` is a placeholder; change it (go.mod and imports) once the real repo exists.
+- `internal/proxy` files: `server.go` (`Server` as `http.Handler`, configured by `Options`, hit/passthrough/`fill`/`follow`), `store.go` (on-disk layout, ref/blob handling, `link`), `flight.go` (in-progress download state), `indexer.go` (background Packages parsing, persisted index keys), `stats.go` (counters, `GET /_stats`, handled before routing, so no upstream host may be named `_stats`).
+- Two request forms, both via `splitTarget`: prefix mode `GET /<host>/<path>` and proxy mode `GET http://<host>/<path>` (absolute URI; `:80` stripped since upstream scheme is ours to choose). Both share cache key `host/path`. `CONNECT` returns 501 with a hint to use prefix mode. Query strings are ignored. Plain-http-only upstreams need `-http-hosts` in either mode.
+- Storage (`store.go`): content-addressed. `<dir>/blobs/<xx>/<sha256>` holds content once; `<dir>/refs/<xx>/<sha256(key)>.json` maps a key to a blob plus ETag/Last-Modified/Content-Type. Downloads go to `<dir>/tmp`, are sha256-hashed while streaming, then renamed into `blobs/` (or dropped if the blob already exists). Evicting a blob leaves refs dangling; `open` deletes them lazily. Index freshness = ref file mtime (touched on 304).
+- Hit: `http.ServeContent` (sendfile, ranges).
+- `fill` withholds the final chunk from followers until the blob and ref are committed (when Content-Length is known), so a client holding the full body can rely on the next request being a hit. Tests that fetch then immediately re-fetch depend on this.
+- Miss (GET, no Range): `join` creates or reuses a `flight` per key; detached goroutine `fill` downloads upstream into a temp file and commits only if complete (Content-Length match, clean EOF). Every client, first one included, `follow`s the temp file up to `flight.written`, woken via the `changed` channel. So concurrent requests for one URL cause one upstream fetch, and the download finishes even if all clients disconnect. A failed download after headers were sent aborts followers' connections (`http.ErrAbortHandler`). Non-200 upstream bodies (<=1 MB) are held in memory, shared, never cached.
+- Range/HEAD requests on a miss and temp-file failures use `passthrough` (uncached). Stalled upstream bodies are cancelled after 60 s without data.
+- Eviction (`internal/lru`): in-memory map (blob path to size and last-delivered time). `Touch` on every hit; `Record` on commit. Over `-max-size` (default 20GB, 0 = unlimited) a background goroutine deletes oldest-delivered objects down to 90%. Unlinking an object being streamed is safe (open fd).
+- Last-use times persist in `<dir>/state.json` (relative paths; atomic write): saved every minute if changed (`Server.saveLoop`) and on SIGINT/SIGTERM (`main.go` shuts down gracefully, `Server.Close`). `scan` at startup rebuilds the map from `objects/`, using saved times, else file mtime. A crash loses at most a minute of use times.
+- Chaining (`Options.Parent`, `-parent`): `upstreamURL` returns `<parent>/<host>/<path>` instead of the mirror URL, so the parent sees an ordinary prefix-mode request (and answers the child's conditional requests via `ServeContent`). Scheme and `-http-hosts` therefore only apply on the instance that reaches the mirrors. Loop guard: forwarded requests carry `X-Cachealot-Via: id1,id2`; `loop()` answers 508 if the instance's own random id is present or the chain has 8 entries. The via value is stored on the `flight` of the request that started the download. Freshness sync: hits on index files send `Age` (now minus ref mtime, `ref.Validated`); a child with `Parent` set backdates the ref mtime by the parent's `Age` (`parentAge`, on both 200 and 304), so TTLs do not add up. The child sends `Cache-Control: max-age=<ttl>` for index fetches; `requestTTL` honors a request's max-age only if the via header is present (apt sends max-age=0 on each update, which must not force upstream checks). The effective ttl travels in `flight.ttl`. No fallback to the internet when the parent is down (deliberate; stale indexes are still served).
+- Index files (anything not `.deb`/`.udeb`/`by-hash`) older than `-index-ttl` are stale: `fill` sends If-None-Match/If-Modified-Since from the ref. 304 touches the file mtime and serves the cache; 200 replaces it; connection error or 5xx serves the stale copy (`flight.stale`). Freshness = file mtime, not the Last-Modified header.
+- Skipping downloads (`link` in `store.go`, `internal/pkgindex`): before fetching a non-index key, `link` checks whether its content is already known: (1) `pkgindex.Index` maps `host/<repo root><Filename>` to sha256, filled by parsing Packages indexes after they are committed (`isPackagesIndex`, background `parseLoop`; plain/gz/bz2/xz sniffed by magic bytes, needs `github.com/ulikunitz/xz`); (2) `.../by-hash/SHA256/<hex>` URLs carry their hash. If that blob exists, a ref is written and it is a HIT with no upstream request. Entries are scoped per host and repo root, so repos reusing a pool path with different content never mix. Keys of parsed indexes persist in `<dir>/indexes.json` and are re-parsed at startup. PDiff-patched indexes are never seen whole, so they are not indexed.
+
+`Dockerfile.az` / `aicatraz.yaml` / `.dockerignore` are sandbox tooling for this dev jail, not part of the product. The jail's apt uses a proxy at `http://barbara:3142`.
+
+## Intended design (from `docs/idea.md`)
+apt-cachealot: caching proxy for Debian apt traffic, for repeatedly spinning up Debian containers over slow internet.
+
+- Two client modes: classic proxy (`Acquire::http::Proxy "http://host:3142";`) and URL prefixing: `http://cache:3142/<host[:port]>/<path>` (e.g. `/deb.debian.org/debian/dists/...`), no per-host config needed.
+- Upstream scheme is chosen by the cache, not the client: default https, per-host override. Cache key is host+path, scheme-independent. `https://` via proxy mode (CONNECT) cannot be cached; use prefix mode there.
+- Internal use: no auth. Upstream host allowlist optional, default off.
+- Cache hit: zero-copy streaming. Cache miss: tee upstream to client and cache simultaneously (never download-then-deliver).
+- Dedup by content: same `.deb` fetched via different URLs is stored once and served from cache (done: blobs by sha256, plus download-skipping via Packages).
+- `.deb` files never revalidated; index files (Packages, Release, etc.) revalidated at a configurable interval.
+- Eviction by max total storage size, not TTL. Least-recently-delivered first (LRU or better).

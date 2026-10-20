@@ -1,0 +1,26 @@
+# Usage:
+#   mkdir -p data                      # create it yourself, docker would create it owned by root
+#   CACHE_UID=$(id -u) CACHE_GID=$(id -g) docker compose up -d --build
+#   curl -s localhost:3142/_stats
+#
+# The container runs as CACHE_UID:CACHE_GID (default 65532, the image's own user), so ./data
+# must be writable by that user. Running as your own user, as above, is the easy way.
+
+services:
+  apt-cachealot:
+    build: .
+    image: apt-cachealot
+    restart: unless-stopped
+    user: "${CACHE_UID:-65532}:${CACHE_GID:-65532}"
+    ports:
+      - "3142:3142"
+    volumes:
+      - ./data:/cache
+    # flags are appended to the image's entrypoint (see README for all of them)
+    command:
+      - -max-size=50GB
+      # - -index-ttl=2m
+      # - -http-hosts=mirror.internal.example   # upstream hosts without https
+      #
+      # chained instance: ask another apt-cachealot instead of the internet
+      # - -parent=http://cache.lan:3142

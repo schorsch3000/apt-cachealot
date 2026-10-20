@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-formatted:"; echo "$unformatted"; exit 1
+          fi
+      - name: go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      - name: static build
+        run: CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/apt-cachealot
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: apt-cachealot:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: smoke test the container
+        run: |
+          set -euo pipefail
+          # plain-http stand-in for a mirror
+          mkdir -p upstream/pool
+          head -c 1500000 /dev/urandom > upstream/pool/smoke.deb
+          python3 -m http.server 8000 --bind 127.0.0.1 --directory upstream >/dev/null 2>&1 &
+          upstream_pid=$!
+          trap 'kill $upstream_pid 2>/dev/null || true' EXIT
+          sleep 1
+
+          check() { # name, then extra `docker run` flags
+            name=$1; shift
+            docker run -d --name "$name" --network host \
+              --health-interval 2s --health-start-period 1s \
+              "$@" apt-cachealot:ci -http-hosts=127.0.0.1:8000
+            for _ in $(seq 30); do
+              [ "$(docker inspect -f '{{.State.Health.Status}}' "$name")" = healthy ] && break
+              sleep 1
+            done
+            if [ "$(docker inspect -f '{{.State.Health.Status}}' "$name")" != healthy ]; then
+              docker logs "$name"; exit 1
+            fi
+            ./scripts/smoke.sh http://127.0.0.1:3142 127.0.0.1:8000
+            docker stop "$name" >/dev/null
+            code=$(docker inspect -f '{{.State.ExitCode}}' "$name")
+            if [ "$code" != 0 ]; then docker logs "$name"; echo "exit code $code"; exit 1; fi
+            docker rm "$name" >/dev/null
+          }
+
+          # 1. the image as is: default user, anonymous volume (needs the chown'ed /cache)
+          check default-user
+
+          # 2. as in docker-compose.yml: bind mount owned by the host user
+          mkdir data
+          check compose-like --user "$(id -u):$(id -g)" -v "$PWD/data:/cache"
+          # graceful shutdown must have saved last-use times
+          test -s data/state.json
+          ls data
