@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/schorsch3000/apt-cachealot/internal/lru"
@@ -30,25 +31,28 @@ import (
 // Server is a caching reverse proxy for apt repositories.
 // Request path format: /<host[:port]>/<path>.
 type Server struct {
-	dir       string
-	scheme    string
-	parent    string // base URL of the parent instance, or ""
-	id        string // random per process, used to detect request loops
-	httpHosts map[string]bool
-	indexTTL  time.Duration
-	client    *http.Client
-	bufs      sync.Pool
-	mu        sync.Mutex
-	flights   map[string]*flight
-	lru       *lru.LRU
-	idx       *pkgindex.Index
-	stats     stats
-	parseQ    chan string
-	keysMu    sync.Mutex
-	indexKeys map[string]bool
-	stop      chan struct{}
-	stopped   sync.WaitGroup
-	closeOnce sync.Once
+	dir             string
+	scheme          string
+	parent          string // base URL of the parent instance, or ""
+	id              string // random per process, used to detect request loops
+	httpHosts       map[string]bool
+	indexTTL        time.Duration
+	client          *http.Client
+	parentClient    *http.Client // short connect timeout, so a missing parent is noticed quickly
+	fallback        bool
+	parentDownUntil atomic.Int64 // unix nanos; while in the future, skip the parent
+	bufs            sync.Pool
+	mu              sync.Mutex
+	flights         map[string]*flight
+	lru             *lru.LRU
+	idx             *pkgindex.Index
+	stats           stats
+	parseQ          chan string
+	keysMu          sync.Mutex
+	indexKeys       map[string]bool
+	stop            chan struct{}
+	stopped         sync.WaitGroup
+	closeOnce       sync.Once
 }
 
 // Options configures a Server.
@@ -62,6 +66,22 @@ type Options struct {
 	// If set, upstream requests go to it in prefix mode instead of to the mirrors;
 	// Scheme and HTTPHosts then only matter on the parent.
 	Parent string
+	// ParentFallback makes the instance fetch from the mirrors itself when the
+	// parent cannot be reached at all (connection refused, no route, DNS failure),
+	// and keep doing so for a short while before trying the parent again.
+	ParentFallback bool
+}
+
+func newTransport(dialTimeout time.Duration) *http.Transport {
+	return &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   32,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		DisableCompression:    true, // pass bytes through untouched
+	}
 }
 
 func NewServer(o Options) (*Server, error) {
@@ -89,31 +109,24 @@ func NewServer(o Options) (*Server, error) {
 			hosts[h] = true
 		}
 	}
-	tr := &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   32,
-		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		DisableCompression:    true, // pass bytes through untouched
-	}
 	s := &Server{
-		dir:       dir,
-		scheme:    scheme,
-		parent:    parent,
-		id:        newID(),
-		httpHosts: hosts,
-		indexTTL:  indexTTL,
-		client:    &http.Client{Transport: tr},
-		flights:   map[string]*flight{},
-		bufs:      sync.Pool{New: func() any { b := make([]byte, 128<<10); return &b }},
-		lru:       l,
-		idx:       pkgindex.New(),
-		stats:     stats{started: time.Now()},
-		parseQ:    make(chan string, 64),
-		indexKeys: map[string]bool{},
-		stop:      make(chan struct{}),
+		dir:          dir,
+		scheme:       scheme,
+		parent:       parent,
+		id:           newID(),
+		httpHosts:    hosts,
+		indexTTL:     indexTTL,
+		client:       &http.Client{Transport: newTransport(10 * time.Second)},
+		parentClient: &http.Client{Transport: newTransport(2 * time.Second)},
+		fallback:     o.ParentFallback && parent != "",
+		flights:      map[string]*flight{},
+		bufs:         sync.Pool{New: func() any { b := make([]byte, 128<<10); return &b }},
+		lru:          l,
+		idx:          pkgindex.New(),
+		stats:        stats{started: time.Now()},
+		parseQ:       make(chan string, 64),
+		indexKeys:    map[string]bool{},
+		stop:         make(chan struct{}),
 	}
 	s.stopped.Add(2)
 	go s.saveLoop(saveInterval)
@@ -252,15 +265,56 @@ func (s *Server) serveHit(w http.ResponseWriter, r *http.Request, f *os.File, m 
 	http.ServeContent(w, r, "", mod, f)
 }
 
-func (s *Server) upstreamURL(host, rest string) string {
-	if s.parent != "" {
-		return s.parent + "/" + host + "/" + rest // the parent picks the scheme
-	}
+// mirrorURL is where host/rest lives on the mirror itself.
+func (s *Server) mirrorURL(host, rest string) string {
 	scheme := s.scheme
 	if s.httpHosts[host] {
 		scheme = "http"
 	}
 	return fmt.Sprintf("%s://%s/%s", scheme, host, rest)
+}
+
+const parentBackoff = 30 * time.Second
+
+func (s *Server) parentDown() bool { return time.Now().UnixNano() < s.parentDownUntil.Load() }
+
+// cannotConnect reports a failure to reach the host at all, as opposed to a slow or
+// failing answer: only that justifies bypassing the parent.
+func cannotConnect(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
+}
+
+// fetch sends one upstream request: to the parent if there is one and it is
+// reachable, otherwise to the mirror. build customises the request; viaParent
+// tells it (and the caller) which of the two it is.
+func (s *Server) fetch(ctx context.Context, method, host, rest string, build func(req *http.Request, viaParent bool)) (resp *http.Response, viaParent bool, err error) {
+	if s.parent != "" && !s.parentDown() {
+		req, err := http.NewRequestWithContext(ctx, method, s.parent+"/"+host+"/"+rest, nil) // the parent picks the scheme
+		if err != nil {
+			return nil, true, err
+		}
+		build(req, true)
+		resp, err := s.parentClient.Do(req)
+		if err == nil {
+			return resp, true, nil
+		}
+		if !s.fallback || ctx.Err() != nil || !cannotConnect(err) {
+			return nil, true, err
+		}
+		s.parentDownUntil.Store(time.Now().Add(parentBackoff).UnixNano())
+		slog.Warn("parent unreachable, fetching from the mirrors directly for a while", "parent", s.parent, "for", parentBackoff, "err", err)
+	}
+	if s.parent != "" {
+		s.stats.parentFallbacks.Add(1)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, s.mirrorURL(host, rest), nil)
+	if err != nil {
+		return nil, false, err
+	}
+	build(req, false)
+	resp, err = s.client.Do(req)
+	return resp, false, err
 }
 
 // viaHeader lists the instances a request has passed through (comma separated ids).
@@ -325,8 +379,8 @@ func (s *Server) requestTTL(r *http.Request, via string) time.Duration {
 // parentAge reads the Age header of a response from the parent instance: how long
 // ago the parent last validated its copy. Index freshness here is measured from
 // that moment, so a chain's total staleness does not add up.
-func (s *Server) parentAge(h http.Header) time.Duration {
-	if s.parent == "" {
+func (s *Server) parentAge(h http.Header, viaParent bool) time.Duration {
+	if !viaParent { // mirrors and CDNs send Age too, with a different meaning
 		return 0
 	}
 	n, err := strconv.Atoi(h.Get("Age"))
@@ -341,20 +395,18 @@ var copiedHeaders = []string{"Content-Length", "Content-Type", "Content-Range", 
 // passthrough proxies one request without caching (ranges, HEAD, fallback).
 func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, host, rest string) {
 	s.stats.passthrough.Add(1)
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, s.upstreamURL(host, rest), nil)
-	if err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	for _, k := range []string{"Range", "If-Range", "If-Modified-Since", "If-None-Match", "User-Agent"} {
-		if v := r.Header.Get(k); v != "" {
-			req.Header.Set(k, v)
+	resp, _, err := s.fetch(r.Context(), r.Method, host, rest, func(req *http.Request, viaParent bool) {
+		for _, k := range []string{"Range", "If-Range", "If-Modified-Since", "If-None-Match", "User-Agent"} {
+			if v := r.Header.Get(k); v != "" {
+				req.Header.Set(k, v)
+			}
 		}
-	}
-	s.setVia(req, r.Header.Get(viaHeader))
-	resp, err := s.client.Do(req)
+		if viaParent {
+			s.setVia(req, r.Header.Get(viaHeader))
+		}
+	})
 	if err != nil {
-		slog.Warn("upstream", "url", req.URL.String(), "err", err)
+		slog.Warn("upstream", "host", host, "path", rest, "err", err)
 		s.badGateway(w)
 		return
 	}
@@ -522,29 +574,27 @@ func (s *Server) fill(f *flight, host, rest, userAgent string) {
 	watchdog := time.AfterFunc(stallTimeout, cancel)
 	defer watchdog.Stop()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.upstreamURL(host, rest), nil)
-	if err != nil {
-		f.err = err
-		return
-	}
-	if userAgent != "" {
-		req.Header.Set("User-Agent", userAgent)
-	}
-	s.setVia(req, f.via)
-	if s.parent != "" && isIndex(rest) { // ask the parent for data at least as fresh as we would accept
-		req.Header.Set("Cache-Control", "max-age="+strconv.Itoa(int(f.ttl.Seconds())))
-	}
-	if haveStale {
-		if validators.ETag != "" {
-			req.Header.Set("If-None-Match", validators.ETag)
+	resp, viaParent, err := s.fetch(ctx, http.MethodGet, host, rest, func(req *http.Request, viaParent bool) {
+		if userAgent != "" {
+			req.Header.Set("User-Agent", userAgent)
 		}
-		if validators.LastModified != "" {
-			req.Header.Set("If-Modified-Since", validators.LastModified)
+		if viaParent {
+			s.setVia(req, f.via)
+			if isIndex(rest) { // ask the parent for data at least as fresh as we would accept
+				req.Header.Set("Cache-Control", "max-age="+strconv.Itoa(int(f.ttl.Seconds())))
+			}
 		}
-	}
-	resp, err := s.client.Do(req)
+		if haveStale {
+			if validators.ETag != "" {
+				req.Header.Set("If-None-Match", validators.ETag)
+			}
+			if validators.LastModified != "" {
+				req.Header.Set("If-Modified-Since", validators.LastModified)
+			}
+		}
+	})
 	if err != nil {
-		slog.Warn("upstream", "url", req.URL.String(), "err", err, "stale", haveStale)
+		slog.Warn("upstream", "host", host, "path", rest, "err", err, "stale", haveStale)
 		f.err, f.stale = err, haveStale
 		return
 	}
@@ -553,7 +603,7 @@ func (s *Server) fill(f *flight, host, rest, userAgent string) {
 		switch {
 		case resp.StatusCode == http.StatusNotModified:
 			s.stats.revalidated.Add(1)
-			t := time.Now().Add(-s.parentAge(resp.Header))
+			t := time.Now().Add(-s.parentAge(resp.Header, viaParent))
 			_ = os.Chtimes(s.refPath(f.key), t, t)
 			f.retry = true
 			f.setReady()
@@ -616,7 +666,7 @@ func (s *Server) fill(f *flight, host, rest, userAgent string) {
 			break
 		}
 		if rerr != nil {
-			slog.Warn("upstream body", "url", req.URL.String(), "err", rerr)
+			slog.Warn("upstream body", "host", host, "path", rest, "err", rerr)
 			return
 		}
 	}
@@ -626,7 +676,7 @@ func (s *Server) fill(f *flight, host, rest, userAgent string) {
 	sum := hex.EncodeToString(hash.Sum(nil))
 	f.setBlob(s.blobPath(sum)) // followers fall back to this once the temp file is renamed
 	var validated time.Time
-	if age := s.parentAge(resp.Header); age > 0 {
+	if age := s.parentAge(resp.Header, viaParent); age > 0 {
 		validated = time.Now().Add(-age)
 	}
 	if err := s.commit(f.tmpPath, f.key, sum, total, ref{

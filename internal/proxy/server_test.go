@@ -400,3 +400,125 @@ func TestChainAgeIsPropagatedOnRevalidation(t *testing.T) {
 		t.Fatalf("mirror was asked %d times; the parent's copy was fresh", c.cond.Load())
 	}
 }
+
+// deadParentURL returns the URL of a server that is no longer listening.
+func deadParentURL(t *testing.T) string {
+	t.Helper()
+	d := httptest.NewServer(http.NotFoundHandler())
+	u := d.URL
+	d.Close()
+	return u
+}
+
+func TestParentFallback(t *testing.T) {
+	var hits atomic.Int32
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Age", "9999") // a CDN's idea of age, not a parent's: must be ignored
+		w.Write([]byte("from the mirror " + r.URL.Path))
+	}))
+	defer mirror.Close()
+	host := strings.TrimPrefix(mirror.URL, "http://")
+
+	s, err := NewServer(Options{Dir: t.TempDir(), HTTPHosts: []string{host}, IndexTTL: time.Hour,
+		Parent: deadParentURL(t), ParentFallback: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	p := httptest.NewServer(s)
+	defer p.Close()
+
+	if xc, b := get(t, p.URL+"/"+host+"/debian/dists/x/Release"); xc != "MISS" || string(b) != "from the mirror /debian/dists/x/Release" {
+		t.Fatalf("index via fallback: xcache=%q body=%q", xc, b)
+	}
+	if !s.parentDown() {
+		t.Fatal("parent not marked down")
+	}
+	st, err := os.Stat(s.refPath(host + "/debian/dists/x/Release"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if age := time.Since(st.ModTime()); age > time.Minute {
+		t.Fatalf("a mirror's Age header was taken as the parent's: index age %v", age)
+	}
+	// while the parent is marked down, requests go straight to the mirror
+	if xc, _ := get(t, p.URL+"/"+host+"/pool/a.deb"); xc != "MISS" {
+		t.Fatalf("second request: xcache=%q", xc)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("mirror hits = %d, want 2", hits.Load())
+	}
+	if s.stats.parentFallbacks.Load() != 2 {
+		t.Fatalf("parent_fallbacks = %d, want 2", s.stats.parentFallbacks.Load())
+	}
+}
+
+func TestNoParentFallbackByDefault(t *testing.T) {
+	var hits atomic.Int32
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }))
+	defer mirror.Close()
+	host := strings.TrimPrefix(mirror.URL, "http://")
+	s, _ := NewServer(Options{Dir: t.TempDir(), HTTPHosts: []string{host}, IndexTTL: time.Hour, Parent: deadParentURL(t)})
+	defer s.Close()
+	p := httptest.NewServer(s)
+	defer p.Close()
+	resp, err := http.Get(p.URL + "/" + host + "/pool/a.deb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway || hits.Load() != 0 {
+		t.Fatalf("status=%d mirror hits=%d, want 502 and 0", resp.StatusCode, hits.Load())
+	}
+}
+
+// A parent that answers, even with an error, is not "unreachable".
+func TestNoFallbackWhenParentAnswers(t *testing.T) {
+	var hits atomic.Int32
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }))
+	defer mirror.Close()
+	host := strings.TrimPrefix(mirror.URL, "http://")
+	parent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "parent trouble", http.StatusServiceUnavailable)
+	}))
+	defer parent.Close()
+	s, _ := NewServer(Options{Dir: t.TempDir(), HTTPHosts: []string{host}, IndexTTL: time.Hour, Parent: parent.URL, ParentFallback: true})
+	defer s.Close()
+	p := httptest.NewServer(s)
+	defer p.Close()
+	resp, err := http.Get(p.URL + "/" + host + "/pool/a.deb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || hits.Load() != 0 || s.parentDown() {
+		t.Fatalf("status=%d mirror hits=%d down=%v", resp.StatusCode, hits.Load(), s.parentDown())
+	}
+}
+
+// A parent that accepts the connection but then drops it is broken, not absent:
+// only "cannot connect" bypasses it.
+func TestNoFallbackWhenParentDropsConnection(t *testing.T) {
+	var hits atomic.Int32
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }))
+	defer mirror.Close()
+	host := strings.TrimPrefix(mirror.URL, "http://")
+	parent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, _ := w.(http.Hijacker).Hijack()
+		conn.Close()
+	}))
+	defer parent.Close()
+	s, _ := NewServer(Options{Dir: t.TempDir(), HTTPHosts: []string{host}, IndexTTL: time.Hour, Parent: parent.URL, ParentFallback: true})
+	defer s.Close()
+	p := httptest.NewServer(s)
+	defer p.Close()
+	resp, err := http.Get(p.URL + "/" + host + "/pool/a.deb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway || hits.Load() != 0 || s.parentDown() {
+		t.Fatalf("status=%d mirror hits=%d down=%v, want 502, 0, false", resp.StatusCode, hits.Load(), s.parentDown())
+	}
+}

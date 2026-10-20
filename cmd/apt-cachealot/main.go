@@ -25,6 +25,7 @@ func main() {
 	indexTTL := flag.Duration("index-ttl", 5*time.Minute, "max age of cached index files before refetch")
 	maxSize := flag.String("max-size", "20GB", "max cache size, e.g. 500M, 20GB, 1TB; 0 = unlimited")
 	parent := flag.String("parent", "", "base URL of another apt-cachealot to fetch from instead of the mirrors, e.g. http://cache.lan:3142")
+	parentFallback := flag.Bool("parent-fallback", false, "if the parent cannot be reached at all, fetch from the mirrors directly (for 30s at a time)")
 	healthcheck := flag.Bool("healthcheck", false, "query a running instance on -listen and exit 0 if healthy (for container health checks)")
 	flag.Parse()
 
@@ -40,7 +41,7 @@ func main() {
 
 	s, err := proxy.NewServer(proxy.Options{
 		Dir: *dir, Scheme: *scheme, HTTPHosts: strings.Split(*httpHosts, ","),
-		IndexTTL: *indexTTL, MaxSize: max, Parent: *parent,
+		IndexTTL: *indexTTL, MaxSize: max, Parent: *parent, ParentFallback: *parentFallback,
 	})
 	if err != nil {
 		slog.Error("init", "err", err)

@@ -14,15 +14,16 @@ import (
 type stats struct {
 	started time.Time
 
-	requests    atomic.Int64 // all proxied requests (not /_stats)
-	hits        atomic.Int64 // served from cache, incl. linked and stale
-	misses      atomic.Int64 // upstream responses that needed a download (not 304 revalidations)
-	coalesced   atomic.Int64 // joined a download already running
-	passthrough atomic.Int64 // uncached (ranges, HEAD, fallback)
-	errors      atomic.Int64 // 502s
-	linked      atomic.Int64 // hits that avoided a download via Packages / by-hash
-	revalidated atomic.Int64 // index refreshed with a 304
-	staleServed atomic.Int64 // stale index served because upstream failed
+	requests        atomic.Int64 // all proxied requests (not /_stats)
+	hits            atomic.Int64 // served from cache, incl. linked and stale
+	misses          atomic.Int64 // upstream responses that needed a download (not 304 revalidations)
+	coalesced       atomic.Int64 // joined a download already running
+	passthrough     atomic.Int64 // uncached (ranges, HEAD, fallback)
+	errors          atomic.Int64 // 502s
+	linked          atomic.Int64 // hits that avoided a download via Packages / by-hash
+	revalidated     atomic.Int64 // index refreshed with a 304
+	staleServed     atomic.Int64 // stale index served because upstream failed
+	parentFallbacks atomic.Int64 // requests sent to the mirrors because the parent was unreachable
 
 	bytesFromCache    atomic.Int64 // size of cached files delivered (range requests not counted)
 	bytesFromUpstream atomic.Int64
@@ -59,14 +60,16 @@ func (s *Server) serveStats(w http.ResponseWriter) {
 	}
 
 	out := map[string]any{
-		"uptime_seconds": int64(time.Since(st.started).Seconds()),
-		"parent":         s.parent,
-		"requests":       st.requests.Load(),
-		"hits":           hits,
-		"misses":         misses,
-		"coalesced":      coal,
-		"passthrough":    st.passthrough.Load(),
-		"errors":         st.errors.Load(),
+		"uptime_seconds":   int64(time.Since(st.started).Seconds()),
+		"parent":           s.parent,
+		"parent_down":      s.parentDown(),
+		"parent_fallbacks": st.parentFallbacks.Load(),
+		"requests":         st.requests.Load(),
+		"hits":             hits,
+		"misses":           misses,
+		"coalesced":        coal,
+		"passthrough":      st.passthrough.Load(),
+		"errors":           st.errors.Load(),
 		// share of cacheable requests answered without waiting for a new download
 		"hit_rate":                ratio(hits, hits+misses+coal),
 		"linked_without_download": st.linked.Load(),
