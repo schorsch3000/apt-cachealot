@@ -125,5 +125,29 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # version tags also get a GitHub release with binaries (linux amd64, arm64, armv7)
+  release:
+    needs: [test, docker]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build archives
+        run: ./scripts/release-build.sh "$GITHUB_REF_NAME" dist
+      - name: create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          args=(--verify-tag --generate-notes --title "$GITHUB_REF_NAME")
+          case "$GITHUB_REF_NAME" in *-*) args+=(--prerelease) ;; esac # v1.2.3-rc1
+          gh release create "$GITHUB_REF_NAME" "${args[@]}" dist/*

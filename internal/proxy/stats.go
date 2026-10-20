@@ -60,6 +60,7 @@ func (s *Server) serveStats(w http.ResponseWriter) {
 	}
 
 	out := map[string]any{
+		"version":          s.version,
 		"uptime_seconds":   int64(time.Since(st.started).Seconds()),
 		"parent":           s.parent,
 		"parent_down":      s.parentDown(),

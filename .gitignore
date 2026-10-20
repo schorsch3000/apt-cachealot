@@ -4,5 +4,5 @@
 /.idea/
 
 # local dev-jail files, not part of the project
-/Dockerfile.az
+/Dockerfile.az*
 /aicatraz.yaml

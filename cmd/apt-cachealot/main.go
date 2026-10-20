@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -17,6 +18,9 @@ import (
 	"github.com/schorsch3000/apt-cachealot/internal/proxy"
 )
 
+// version is set at build time (-ldflags "-X main.version=v1.2.3").
+var version = "dev"
+
 func main() {
 	listen := flag.String("listen", ":3142", "listen address")
 	dir := flag.String("dir", "./cache", "cache directory")
@@ -27,9 +31,14 @@ func main() {
 	parent := flag.String("parent", "", "base URL of another apt-cachealot to fetch from instead of the mirrors, e.g. http://cache.lan:3142")
 	parentFallback := flag.Bool("parent-fallback", false, "if the parent cannot be reached at all, fetch from the mirrors directly (for 30s at a time)")
 	publicURL := flag.String("public-url", "", "address clients use to reach this instance, e.g. http://cache.lan:3142 (for /_apt.conf and /_setup.sh; default: taken from each request)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	healthcheck := flag.Bool("healthcheck", false, "query a running instance on -listen and exit 0 if healthy (for container health checks)")
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Println("apt-cachealot", version)
+		return
+	}
 	if *healthcheck {
 		os.Exit(runHealthcheck(*listen))
 	}
@@ -42,13 +51,13 @@ func main() {
 
 	s, err := proxy.NewServer(proxy.Options{
 		Dir: *dir, Scheme: *scheme, HTTPHosts: strings.Split(*httpHosts, ","),
-		IndexTTL: *indexTTL, MaxSize: max, Parent: *parent, ParentFallback: *parentFallback, PublicURL: *publicURL,
+		IndexTTL: *indexTTL, MaxSize: max, Parent: *parent, ParentFallback: *parentFallback, PublicURL: *publicURL, Version: version,
 	})
 	if err != nil {
 		slog.Error("init", "err", err)
 		os.Exit(1)
 	}
-	slog.Info("listening", "addr", *listen, "dir", *dir, "parent", *parent)
+	slog.Info("listening", "version", version, "addr", *listen, "dir", *dir, "parent", *parent)
 	srv := &http.Server{Addr: *listen, Handler: s, ReadHeaderTimeout: 10 * time.Second}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

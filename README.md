@@ -30,6 +30,13 @@ CACHE_UID=$(id -u) CACHE_GID=$(id -g) docker compose up -d
 
 Create `data` yourself: if Docker creates it, it belongs to root and the container user cannot write to it.
 
+Binaries: every release (`v*` tag) has linux archives for amd64, arm64 and armv7 on the [releases page](https://github.com/schorsch3000/apt-cachealot/releases), with a `SHA256SUMS` file:
+
+```
+tar -xzf apt-cachealot_v1.2.3_linux_amd64.tar.gz
+./apt-cachealot_v1.2.3_linux_amd64/apt-cachealot -dir /var/cache/apt-cachealot
+```
+
 From source (Go 1.27+):
 
 ```
@@ -79,6 +86,7 @@ The cache still fetches upstream over https unless the host is listed in `-http-
 | `-parent` | | base URL of another apt-cachealot to fetch from instead of the mirrors (see below) |
 | `-parent-fallback` | off | with `-parent`: if the parent cannot be reached at all, fetch from the mirrors directly |
 | `-http-hosts` | | comma separated hosts (`host` or `host:port`) to fetch over plain http |
+| `-version` | | print the version and exit |
 | `-healthcheck` | | query a running instance and exit 0 if healthy (used by the Docker `HEALTHCHECK`) |
 
 There is no authentication and any host can be requested through the cache, so run it only on a trusted network.
@@ -122,7 +130,7 @@ Known limits: indexes that apt updates with pdiff patches are never seen as a wh
 
 ## Development
 
-Layout: `cmd/apt-cachealot` (flags, shutdown), `internal/proxy` (HTTP handler, storage, stats), `internal/lru` (size limit and eviction), `internal/pkgindex` (Packages parsing), `scripts/bench.sh` and `scripts/smoke.sh` (benchmark, end-to-end check), `docs/idea.md` (original design notes).
+Layout: `cmd/apt-cachealot` (flags, shutdown), `internal/proxy` (HTTP handler, storage, stats), `internal/lru` (size limit and eviction), `internal/pkgindex` (Packages parsing), `scripts/bench.sh`, `scripts/smoke.sh` and `scripts/release-build.sh` (benchmark, end-to-end check, release archives), `docs/idea.md` (original design notes).
 
 ```
 GOPATH=$HOME/go go test -race ./...      # GOPATH override only needed where it is set to "~/go"

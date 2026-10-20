@@ -41,6 +41,7 @@ type Server struct {
 	parentClient    *http.Client // short connect timeout, so a missing parent is noticed quickly
 	fallback        bool
 	publicURL       string
+	version         string
 	parentDownUntil atomic.Int64 // unix nanos; while in the future, skip the parent
 	bufs            sync.Pool
 	mu              sync.Mutex
@@ -74,6 +75,8 @@ type Options struct {
 	// PublicURL is the address clients use to reach this instance (http://host[:port]),
 	// shown by /_apt.conf and /_setup.sh. Default: the host and port of each request.
 	PublicURL string
+	// Version is shown by /_stats.
+	Version string
 }
 
 func newTransport(dialTimeout time.Duration) *http.Transport {
@@ -122,6 +125,7 @@ func NewServer(o Options) (*Server, error) {
 		scheme:       scheme,
 		parent:       parent,
 		publicURL:    publicURL,
+		version:      o.Version,
 		id:           newID(),
 		httpHosts:    hosts,
 		indexTTL:     indexTTL,
