@@ -23,8 +23,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/heilig/apt-cachealot/internal/lru"
-	"github.com/heilig/apt-cachealot/internal/pkgindex"
+	"github.com/schorsch3000/apt-cachealot/internal/lru"
+	"github.com/schorsch3000/apt-cachealot/internal/pkgindex"
 )
 
 // Server is a caching reverse proxy for apt repositories.

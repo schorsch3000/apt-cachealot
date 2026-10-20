@@ -1,4 +1,4 @@
-module github.com/heilig/apt-cachealot
+module github.com/schorsch3000/apt-cachealot
 
 go 1.27.2
 

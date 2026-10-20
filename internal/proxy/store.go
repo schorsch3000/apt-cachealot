@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/heilig/apt-cachealot/internal/pkgindex"
+	"github.com/schorsch3000/apt-cachealot/internal/pkgindex"
 )
 
 // Storage layout, all under the cache dir:

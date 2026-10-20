@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/heilig/apt-cachealot/internal/proxy"
+	"github.com/schorsch3000/apt-cachealot/internal/proxy"
 )
 
 func main() {

@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/heilig/apt-cachealot/internal/pkgindex"
+	"github.com/schorsch3000/apt-cachealot/internal/pkgindex"
 )
 
 // schedule queues a cached Packages index for parsing in the background.
