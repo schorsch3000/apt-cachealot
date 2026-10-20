@@ -26,6 +26,7 @@ func main() {
 	maxSize := flag.String("max-size", "20GB", "max cache size, e.g. 500M, 20GB, 1TB; 0 = unlimited")
 	parent := flag.String("parent", "", "base URL of another apt-cachealot to fetch from instead of the mirrors, e.g. http://cache.lan:3142")
 	parentFallback := flag.Bool("parent-fallback", false, "if the parent cannot be reached at all, fetch from the mirrors directly (for 30s at a time)")
+	publicURL := flag.String("public-url", "", "address clients use to reach this instance, e.g. http://cache.lan:3142 (for /_apt.conf and /_setup.sh; default: taken from each request)")
 	healthcheck := flag.Bool("healthcheck", false, "query a running instance on -listen and exit 0 if healthy (for container health checks)")
 	flag.Parse()
 
@@ -41,7 +42,7 @@ func main() {
 
 	s, err := proxy.NewServer(proxy.Options{
 		Dir: *dir, Scheme: *scheme, HTTPHosts: strings.Split(*httpHosts, ","),
-		IndexTTL: *indexTTL, MaxSize: max, Parent: *parent, ParentFallback: *parentFallback,
+		IndexTTL: *indexTTL, MaxSize: max, Parent: *parent, ParentFallback: *parentFallback, PublicURL: *publicURL,
 	})
 	if err != nil {
 		slog.Error("init", "err", err)

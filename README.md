@@ -38,6 +38,16 @@ go build -o apt-cachealot ./cmd/apt-cachealot && ./apt-cachealot -dir ./cache -l
 
 ## Use it from apt
 
+**Quick setup** for plain `http://` sources (the Debian images use these): the cache can write the proxy config for you.
+
+```
+curl -fsS http://apt-cachealot.example.com:3142/_setup.sh | sudo sh            # install
+curl -fsS http://apt-cachealot.example.com:3142/_setup.sh | sudo sh -s -- remove
+curl -fsS http://apt-cachealot.example.com:3142/_apt.conf                      # just the config
+```
+
+`/_setup.sh` writes `/etc/apt/apt.conf.d/01apt-cachealot` (override with `APT_CACHEALOT_CONF`), `/_apt.conf` is its content. The address in them is the one you used to reach the cache, so use the name your clients will use, or set `-public-url` (for example behind NAT or a reverse proxy). Hosts that are not plain names, IPs or `host:port` are refused, because the value ends up in a script you pipe into `sh`.
+
 **Prefix mode** works for http and https mirrors. The mirror host goes into the path, the cache talks to the mirror (https by default):
 
 ```
@@ -65,6 +75,7 @@ The cache still fetches upstream over https unless the host is listed in `-http-
 | `-max-size` | `20GB` | cache size limit (`500M`, `20GB`, `1TB`, `0` = unlimited) |
 | `-index-ttl` | `5m` | how long index files count as fresh before they are revalidated |
 | `-scheme` | `https` | scheme used to reach upstream mirrors |
+| `-public-url` | from the request | address clients use to reach this instance (`http://host[:port]`), shown by `/_apt.conf` and `/_setup.sh` |
 | `-parent` | | base URL of another apt-cachealot to fetch from instead of the mirrors (see below) |
 | `-parent-fallback` | off | with `-parent`: if the parent cannot be reached at all, fetch from the mirrors directly |
 | `-http-hosts` | | comma separated hosts (`host` or `host:port`) to fetch over plain http |

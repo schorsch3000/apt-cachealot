@@ -28,4 +28,6 @@ cmp "$tmp/first" "$tmp/body" || fail "proxy mode body differs"
 stats=$(curl -fsS "$cache/_stats")
 echo "$stats" | grep -q '"misses": 1' || fail "stats: want misses=1: $stats"
 echo "$stats" | grep -q '"hits": 2' || fail "stats: want hits=2: $stats"
+curl -fsS "$cache/_apt.conf" | grep -q '^Acquire::http::Proxy "http://' || fail "/_apt.conf has no proxy line"
+curl -fsS "$cache/_setup.sh" | head -1 | grep -q '^#!/bin/sh' || fail "/_setup.sh is not a shell script"
 echo "smoke test passed"

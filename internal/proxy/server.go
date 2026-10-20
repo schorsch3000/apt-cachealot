@@ -40,6 +40,7 @@ type Server struct {
 	client          *http.Client
 	parentClient    *http.Client // short connect timeout, so a missing parent is noticed quickly
 	fallback        bool
+	publicURL       string
 	parentDownUntil atomic.Int64 // unix nanos; while in the future, skip the parent
 	bufs            sync.Pool
 	mu              sync.Mutex
@@ -70,6 +71,9 @@ type Options struct {
 	// parent cannot be reached at all (connection refused, no route, DNS failure),
 	// and keep doing so for a short while before trying the parent again.
 	ParentFallback bool
+	// PublicURL is the address clients use to reach this instance (http://host[:port]),
+	// shown by /_apt.conf and /_setup.sh. Default: the host and port of each request.
+	PublicURL string
 }
 
 func newTransport(dialTimeout time.Duration) *http.Transport {
@@ -96,6 +100,10 @@ func NewServer(o Options) (*Server, error) {
 			return nil, fmt.Errorf("parent %q: want http(s)://host[:port]", o.Parent)
 		}
 	}
+	publicURL, err := parsePublicURL(o.PublicURL)
+	if err != nil {
+		return nil, err
+	}
 	tmpDir := filepath.Join(dir, "tmp")
 	_ = os.RemoveAll(tmpDir) // leftovers of interrupted downloads
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
@@ -113,6 +121,7 @@ func NewServer(o Options) (*Server, error) {
 		dir:          dir,
 		scheme:       scheme,
 		parent:       parent,
+		publicURL:    publicURL,
 		id:           newID(),
 		httpHosts:    hosts,
 		indexTTL:     indexTTL,
@@ -137,9 +146,15 @@ func NewServer(o Options) (*Server, error) {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Host == "" && r.URL.Path == "/_stats" {
-		s.serveStats(w)
-		return
+	if r.URL.Host == "" {
+		switch r.URL.Path {
+		case "/_stats":
+			s.serveStats(w)
+			return
+		case "/_apt.conf", "/_setup.sh":
+			s.serveSetup(w, r)
+			return
+		}
 	}
 	if s.loop(r.Header.Get(viaHeader)) {
 		http.Error(w, "request loop between apt-cachealot instances (check -parent)", http.StatusLoopDetected)
