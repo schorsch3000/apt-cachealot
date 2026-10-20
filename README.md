@@ -12,18 +12,20 @@ Measured on a 9.7 MB `Packages.xz` (`scripts/bench.sh`): direct 394 ms, through 
 
 ## Run
 
-Docker (about 10 MB: a static binary on `distroless/static`, running as uid 65532). A bind-mounted cache directory must be writable by that uid:
+Docker (about 10 MB: a static binary on `distroless/static`, running as uid 65532; images for amd64 and arm64 are published to GitHub's registry). A bind-mounted cache directory must be writable by that uid:
 
 ```
-docker build -t apt-cachealot .
-docker run -d --name apt-cachealot -p 3142:3142 -v apt-cachealot:/cache apt-cachealot -max-size 50GB
+docker run -d --name apt-cachealot -p 3142:3142 -v apt-cachealot:/cache \
+  ghcr.io/schorsch3000/apt-cachealot -max-size 50GB
 ```
+
+Tags: `latest` follows the main branch, `X.Y.Z` and `X.Y` are releases.
 
 Docker Compose (cache in `./data`, see `docker-compose.yml`):
 
 ```
 mkdir -p data
-CACHE_UID=$(id -u) CACHE_GID=$(id -g) docker compose up -d --build
+CACHE_UID=$(id -u) CACHE_GID=$(id -g) docker compose up -d
 ```
 
 Create `data` yourself: if Docker creates it, it belongs to root and the container user cannot write to it.
@@ -64,6 +66,7 @@ The cache still fetches upstream over https unless the host is listed in `-http-
 | `-index-ttl` | `5m` | how long index files count as fresh before they are revalidated |
 | `-scheme` | `https` | scheme used to reach upstream mirrors |
 | `-parent` | | base URL of another apt-cachealot to fetch from instead of the mirrors (see below) |
+| `-parent-fallback` | off | with `-parent`: if the parent cannot be reached at all, fetch from the mirrors directly |
 | `-http-hosts` | | comma separated hosts (`host` or `host:port`) to fetch over plain http |
 | `-healthcheck` | | query a running instance and exit 0 if healthy (used by the Docker `HEALTHCHECK`) |
 
@@ -85,13 +88,13 @@ The workstation then asks the parent for `http://cache.lan:3142/<host>/<path>` (
 
 - Mirror settings (`-scheme`, `-http-hosts`) only matter on the instance that talks to the mirrors, which is the parent. They are ignored on the child.
 - Index freshness is synchronised. The parent reports how long ago it last validated an index (`Age` header) and the child counts from that moment, so a chain is never staler than the longest single TTL. The child also sends `Cache-Control: max-age=<its TTL>`, so a parent with a longer TTL revalidates instead of handing over a copy the child would discard at once. The parent only honors `max-age` from other instances (requests carrying `X-Cachealot-Via`), never from apt, which sends `max-age=0` on every update.
-- If the parent is unreachable, requests fail with `502` (cached files and stale indexes are still served). There is no automatic fallback to the internet.
+- If the parent is unreachable, requests fail with `502` (cached files and stale indexes are still served). With `-parent-fallback` the instance fetches from the mirrors itself instead, so a laptop away from the LAN keeps working, and tries the parent again after 30 seconds. Only "cannot connect" (refused, no route, DNS) triggers this, not a slow or failing parent, so a misbehaving parent is not silently bypassed. Mirror settings (`-scheme`, `-http-hosts`) then apply on the instance itself.
 - Loops are caught: every forwarded request carries the ids of the instances it passed, and an instance that sees its own id (or a chain of 8) answers `508` instead of recursing.
 - Chains can be longer than two instances.
 
 ## Statistics
 
-Cached index files carry an `Age` header (seconds since they were last validated upstream). `GET /_stats` returns JSON: requests, hits, misses, `hit_rate`, bytes served from cache vs fetched from upstream, `byte_hit_rate`, cache size and object count, downloads in flight, free disk space and the configured parent. A revalidation that ends in a 304 is not counted as a miss. Counters reset when the process restarts.
+Cached index files carry an `Age` header (seconds since they were last validated upstream). `GET /_stats` returns JSON: requests, hits, misses, `hit_rate`, bytes served from cache vs fetched from upstream, `byte_hit_rate`, cache size and object count, downloads in flight, free disk space, the configured parent and whether it is currently bypassed (`parent_down`, `parent_fallbacks`). A revalidation that ends in a 304 is not counted as a miss. Counters reset when the process restarts.
 
 ```
 curl -s http://localhost:3142/_stats

@@ -1,12 +1,15 @@
 # syntax=docker/dockerfile:1
 ARG GO_VERSION=1.27
-FROM golang:${GO_VERSION} AS build
+# cross-compiling on the build platform keeps multi-arch builds fast (no emulation)
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION} AS build
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/apt-cachealot ./cmd/apt-cachealot \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/apt-cachealot ./cmd/apt-cachealot \
  && mkdir /cache-dir
 
 # The binary is static and needs only CA certificates (https upstreams), a non-root

@@ -1,0 +1,13 @@
+# the build only needs go.mod, go.sum, cmd/, internal/ and the license files
+.git
+.github
+.idea
+data
+cache
+apt-cachealot
+docs
+scripts
+*.md
+docker-compose.yml
+Dockerfile.az
+aicatraz.yaml

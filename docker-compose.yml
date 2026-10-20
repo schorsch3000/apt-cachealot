@@ -1,15 +1,17 @@
 # Usage:
 #   mkdir -p data                      # create it yourself, docker would create it owned by root
-#   CACHE_UID=$(id -u) CACHE_GID=$(id -g) docker compose up -d --build
+#   CACHE_UID=$(id -u) CACHE_GID=$(id -g) docker compose up -d
 #   curl -s localhost:3142/_stats
 #
 # The container runs as CACHE_UID:CACHE_GID (default 65532, the image's own user), so ./data
 # must be writable by that user. Running as your own user, as above, is the easy way.
+#
+# To build the image from this checkout instead of pulling it:
+#   docker build -t ghcr.io/schorsch3000/apt-cachealot .
 
 services:
   apt-cachealot:
-    build: .
-    image: apt-cachealot
+    image: ghcr.io/schorsch3000/apt-cachealot:latest
     restart: unless-stopped
     user: "${CACHE_UID:-65532}:${CACHE_GID:-65532}"
     ports:
@@ -24,3 +26,4 @@ services:
       #
       # chained instance: ask another apt-cachealot instead of the internet
       # - -parent=http://cache.lan:3142
+      # - -parent-fallback                       # go to the mirrors if the parent is not reachable
